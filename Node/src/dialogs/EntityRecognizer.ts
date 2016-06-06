@@ -62,12 +62,12 @@ export interface IFindMatchResult {
 
 export class EntityRecognizer {
     static dateExp = /^\d{4}-\d{2}-\d{2}/i;
-    static yesExp = /^(1|y|yes|yep|sure|ok|true)/i;
-    static noExp = /^(0|n|no|nope|not|false)/i;
+    static yesExp = /^(y|yes|yep|sure|ok|true)/i;
+    static noExp = /^(n|no|nope|not|false)/i;
     static numberExp = /[+-]?(?:\d+\.?\d*|\d*\.?\d+)/;
 
     static findEntity(entities: IEntity[], type: string): IEntity {
-        for (var i = 0; i < entities.length; i++) {
+        for (var i = 0; entities && i < entities.length; i++) {
             if (entities[i].type == type) {
                 return entities[i];
             }
@@ -77,7 +77,7 @@ export class EntityRecognizer {
 
     static findAllEntities(entities: IEntity[], type: string): IEntity[] {
         var found: IEntity[] = [];
-        for (var i = 0; i < entities.length; i++) {
+        for (var i = 0; entities && i < entities.length; i++) {
             if (entities[i].type == type) {
                 found.push(entities[i]);
             }

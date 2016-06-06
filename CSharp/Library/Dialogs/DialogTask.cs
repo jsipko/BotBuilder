@@ -45,28 +45,18 @@ using Microsoft.Bot.Connector;
 
 namespace Microsoft.Bot.Builder.Dialogs.Internals
 {
-    public sealed class DialogTask : IDialogTask
+    public sealed class DialogTask : IDialogStack, IPostToBot
     {
-        private readonly Func<IDialogContext> factory;
+        private readonly Func<IDialogContext> makeContext;
         private readonly IStore<IFiberLoop<DialogTask>> store;
         private readonly IFiberLoop<DialogTask> fiber;
         private readonly Frames frames;
-        public DialogTask(Func<IDialogContext> factory, IStore<IFiberLoop<DialogTask>> store)
+        public DialogTask(Func<IDialogContext> makeContext, IStore<IFiberLoop<DialogTask>> store)
         {
-            SetField.NotNull(out this.factory, nameof(factory), factory);
+            SetField.NotNull(out this.makeContext, nameof(makeContext), makeContext);
             SetField.NotNull(out this.store, nameof(store), store);
             this.store.TryLoad(out this.fiber);
             this.frames = new Frames(this);
-        }
-
-        void IDialogTask.Reset()
-        {
-            this.store.Reset();
-        }
-
-        void IDialogTask.Save()
-        {
-            this.store.Save(this.fiber);
         }
 
         private IWait<DialogTask> wait;
@@ -101,7 +91,7 @@ namespace Microsoft.Bot.Builder.Dialogs.Internals
                     throw new ArgumentException(nameof(item));
                 }
 
-                await this.start(task.factory());
+                await this.start(task.makeContext());
                 return task.wait;
             }
         }
@@ -125,7 +115,7 @@ namespace Microsoft.Bot.Builder.Dialogs.Internals
 
             public async Task<IWait<DialogTask>> Rest(IFiber<DialogTask> fiber, DialogTask task, IItem<T> item)
             {
-                await this.resume(task.factory(), item);
+                await this.resume(task.makeContext(), item);
                 return task.wait;
             }
         }
@@ -215,6 +205,14 @@ namespace Microsoft.Bot.Builder.Dialogs.Internals
             }
         }
 
+        async Task IDialogStack.Forward<R, T>(IDialog<R> child, ResumeAfter<R> resume, T item, CancellationToken token)
+        {
+            IDialogStack stack = this;
+            stack.Call(child, resume);
+            await stack.PollAsync(token);
+            await (this as IPostToBot).PostAsync(item, token);
+        }
+
         void IDialogStack.Done<R>(R value)
         {
             this.wait = this.fiber.Done(value);
@@ -230,17 +228,68 @@ namespace Microsoft.Bot.Builder.Dialogs.Internals
             this.wait = this.fiber.Wait<DialogTask, R>(ToRest(resume));
         }
 
-        async Task IDialogTask.PollAsync()
+        async Task IDialogStack.PollAsync(CancellationToken token)
         {
             await this.fiber.PollAsync(this);
         }
 
-        async Task IPostToBot.PostAsync<T>(T item, CancellationToken cancellationToken)
+        async Task IPostToBot.PostAsync<T>(T item, CancellationToken token)
         {
-            this.fiber.Post(item);
-            await this.fiber.PollAsync(this);
+            try
+            {
+                this.fiber.Post(item);
+                await this.fiber.PollAsync(this);
+            }
+            catch
+            {
+                this.store.Reset();
+                throw;
+            }
+            finally
+            {
+                this.store.Save(this.fiber);
+                this.store.Flush(); 
+            }
         }
     }
+
+    public sealed class ReactiveDialogTask : IPostToBot
+    {
+        private readonly IPostToBot inner;
+        private readonly IDialogStack stack;
+        private readonly IStore<IFiberLoop<DialogTask>> store;
+        private readonly Func<IDialog<object>> makeRoot;
+
+        public ReactiveDialogTask(IPostToBot inner, IDialogStack stack, IStore<IFiberLoop<DialogTask>> store, Func<IDialog<object>> makeRoot)
+        {
+            SetField.NotNull(out this.inner, nameof(inner), inner);
+            SetField.NotNull(out this.stack, nameof(stack), stack);
+            SetField.NotNull(out this.store, nameof(store), store);
+            SetField.NotNull(out this.makeRoot, nameof(makeRoot), makeRoot);
+        }
+
+        async Task IPostToBot.PostAsync<T>(T item, CancellationToken token)
+        {
+            try
+            {
+                if (this.stack.Frames.Count == 0)
+                {
+                    var root = this.makeRoot();
+                    var loop = root.Loop();
+                    this.stack.Call(loop, null);
+                    await this.stack.PollAsync(token);
+                }
+
+                await this.inner.PostAsync(item, token);
+            }
+            catch
+            {
+                this.store.Reset();
+                throw;
+            }
+        }
+    }
+
 
     public struct LocalizedScope : IDisposable
     {
@@ -278,19 +327,99 @@ namespace Microsoft.Bot.Builder.Dialogs.Internals
         }
     }
 
-    public sealed class LocalizedDialogTask : DelegatingDialogTask
+    public sealed class LocalizedDialogTask : IPostToBot
     {
-        public LocalizedDialogTask(IDialogTask inner)
-            : base(inner)
+        private readonly IPostToBot inner;
+
+        public LocalizedDialogTask(IPostToBot inner)
         {
+            SetField.NotNull(out this.inner, nameof(inner), inner);
         }
 
-        public override async Task PostAsync<T>(T item, CancellationToken cancellationToken = default(CancellationToken))
+        async Task IPostToBot.PostAsync<T>(T item, CancellationToken token)
         {
             using (new LocalizedScope((item as Message)?.Language))
             {
-                await base.PostAsync<T>(item, cancellationToken);
+                await this.inner.PostAsync<T>(item, token);
             }
+        }
+    }
+
+    public sealed class PersistentDialogTask : IPostToBot
+    {
+        private readonly IPostToBot inner;
+        private readonly IConnectorClient client;
+        private readonly Message message;
+        private readonly IBotToUser botToUser;
+
+        public PersistentDialogTask(IPostToBot inner, Message message, IConnectorClient client, IBotToUser botToUser)
+        {
+            SetField.NotNull(out this.inner, nameof(inner), inner);
+            SetField.NotNull(out this.message, nameof(message), message);
+            SetField.NotNull(out this.client, nameof(client), client);
+            SetField.NotNull(out this.botToUser, nameof(botToUser), botToUser);
+        }
+
+        async Task IPostToBot.PostAsync<T>(T item, CancellationToken token)
+        {
+            try
+            {
+                await this.inner.PostAsync<T>(item, token);
+            }
+            catch
+            {
+                await PersistBotData(token: token);
+                throw;
+
+            }
+
+            // if botToUser is SendLastInline_BotToUser, we don't need to persist.
+            // Inline reply will set the data
+            bool inline = botToUser is SendLastInline_BotToUser || botToUser is BotToUserTextWriter;
+            if (!inline)
+            {
+                await PersistBotData(token: token);
+            }
+        }
+
+        private async Task PersistBotData(bool ignoreETag = true, CancellationToken token = default(CancellationToken))
+        {
+            var botId = message.To.Id;
+            var userId = message.From.Id;
+            var conversationId = message.ConversationId;
+            var etag = "*";
+
+            var conversationData = new BotData(eTag: etag);
+            var perUserInConversationData  = new BotData(eTag: etag);
+            var userData = new BotData(eTag: etag);
+
+            if (!ignoreETag)
+            {
+                var getConversationDataTask = client.Bots.GetConversationDataAsync(botId, conversationId, token);
+                var getPerUserInConversationDataTask = client.Bots.GetPerUserConversationDataAsync(botId, conversationId, userId, token);
+                var getUserDataTask = client.Bots.GetUserDataAsync(botId, userId, token);
+
+                conversationData = await getConversationDataTask;
+                perUserInConversationData = await getPerUserInConversationDataTask;
+                userData = await getUserDataTask;
+            }
+
+            conversationData.Data = message.BotConversationData;
+            perUserInConversationData.Data = message.BotPerUserInConversationData;
+            userData.Data = message.BotUserData;
+            
+            var task1 = client.Bots.SetConversationDataAsync(botId, conversationId,
+                conversationData,
+                token);
+            var task2 = client.Bots.SetPerUserInConversationDataAsync(botId, conversationId, userId,
+                perUserInConversationData,
+                token);
+            var task3 = client.Bots.SetUserDataAsync(botId, userId,
+                userData,
+                token);
+            await task1;
+            await task2;
+            await task3;
         }
     }
 }
